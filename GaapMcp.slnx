@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="GaapMcp.App/GaapMcp.App.csproj" />
+  <Project Path="GaapMcp.Domain/GaapMcp.Domain.csproj" />
+  <Project Path="GaapMcp.Infrastructure/GaapMcp.Infrastructure.csproj" />
+  <Project Path="GaapMcp.Server/GaapMcp.Server.csproj" />
+</Solution>

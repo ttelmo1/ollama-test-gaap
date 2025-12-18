@@ -1,44 +1,28 @@
-﻿using System;
+﻿using GaapMcp.Domain;
+using Microsoft.Extensions.Options;
+using System;
 using System.Collections.Generic;
-using System.Net.Http;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
 
-namespace MyMCPClient
+namespace GaapMcp.Infrastructure
 {
-    public class OllamaClient
+    public class OllamaClient : IOllamaClient
     {
         private readonly HttpClient _httpClient;
-        private readonly string _baseUrl;
-        private readonly string _model;
+        private readonly OllamaOptions _options;
 
-        private const string SystemPrompt = @"
-Você é um assistente útil. Regras importantes sobre ferramentas:
-
-1. Use ferramentas APENAS quando o usuário explicitamente solicitar a informação que a ferramenta fornece
-2. Para saudações (olá, oi, tudo bem) ou conversa casual, NUNCA use ferramentas - responda diretamente
-3. A ferramenta 'get_time' deve ser usada SOMENTE quando o usuário perguntar: ""que horas são?"", ""qual a data?"", ""me diga a hora"", etc.
-4. Se não tiver certeza, prefira NÃO usar a ferramenta e responder normalmente
-
-Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
-";
-
-        public OllamaClient(string model = "llama3.2", string baseUrl = "http://localhost:11434")
+        public OllamaClient(HttpClient httpClient, IOptions<OllamaOptions> options)
         {
-            _httpClient = new HttpClient
-            {
-                Timeout = TimeSpan.FromMinutes(5)
-            };
-
-            _baseUrl = baseUrl;
-            _model = model;
+            _httpClient = httpClient;
+            _options = options.Value;
+            _httpClient.Timeout = TimeSpan.FromMinutes(_options.TimeoutMinutes);
         }
 
         public async Task<string> ChatAsync(
             string message,
-            List<MCPTool>? tools = null,
-            MCPClient? mcpClient = null)
+            IReadOnlyList<IMcpTool>? tools = null,
+            IMcpClient? mcpClient = null)
         {
             var messages = InitializeMessages(message);
 
@@ -48,9 +32,9 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
                 var responseJson = await SendChatRequestAsync(payload);
                 var assistantMessage = responseJson.GetProperty("message");
 
-                messages.Add(JsonSerializer.Deserialize<object>(assistantMessage.GetRawText())!);
+                messages.Add(JsonSerializer.Deserialize<Dictionary<string, object>>(assistantMessage.GetRawText())!);
 
-                if (TryHandleToolCalls(assistantMessage, messages, mcpClient))
+                if (await TryHandleToolCallsAsync(assistantMessage, messages, mcpClient))
                 {
                     continue;
                 }
@@ -59,24 +43,23 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
             }
         }
 
-
-        private static List<object> InitializeMessages(string userMessage)
+        private List<object> InitializeMessages(string userMessage)
         {
             return new List<object>
-            {
-                new { role = "system", content = SystemPrompt },
-                new { role = "user", content = userMessage }
-            };
+        {
+            new { role = "system", content = _options.SystemPrompt },
+            new { role = "user", content = userMessage }
+        };
         }
 
-        private object BuildPayload(List<object> messages, List<MCPTool>? tools)
+        private object BuildPayload(List<object> messages, IReadOnlyList<IMcpTool>? tools)
         {
             return new
             {
-                model = _model,
+                model = _options.Model,
                 messages = messages.ToArray(),
                 stream = false,
-                tools = tools?.ConvertAll(t => new
+                tools = tools?.Select(t => new
                 {
                     type = "function",
                     function = new
@@ -85,7 +68,7 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
                         description = t.Description,
                         parameters = t.InputSchema
                     }
-                })
+                }).ToList()
             };
         }
 
@@ -93,18 +76,18 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
         {
             var json = JsonSerializer.Serialize(payload);
             var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await _httpClient.PostAsync($"{_options.BaseUrl}/api/chat", content);
 
-            var response = await _httpClient.PostAsync($"{_baseUrl}/api/chat", content);
             response.EnsureSuccessStatusCode();
 
             var responseJson = await response.Content.ReadAsStringAsync();
             return JsonSerializer.Deserialize<JsonElement>(responseJson);
         }
 
-        private bool TryHandleToolCalls(
+        private async Task<bool> TryHandleToolCallsAsync(
             JsonElement assistantMessage,
             List<object> messages,
-            MCPClient? mcpClient)
+            IMcpClient? mcpClient)
         {
             if (!assistantMessage.TryGetProperty("tool_calls", out var toolCalls) ||
                 toolCalls.ValueKind != JsonValueKind.Array ||
@@ -123,20 +106,19 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
 
             foreach (var toolCall in toolCalls.EnumerateArray())
             {
-                ProcessToolCall(toolCall, messages, mcpClient).GetAwaiter().GetResult();
+                await ProcessToolCallAsync(toolCall, messages, mcpClient);
             }
 
             return true;
         }
 
-        private async Task ProcessToolCall(
+        private async Task ProcessToolCallAsync(
             JsonElement toolCall,
             List<object> messages,
-            MCPClient mcpClient)
+            IMcpClient mcpClient)
         {
             var function = toolCall.GetProperty("function");
             var toolName = function.GetProperty("name").GetString()!;
-
             var arguments = function.TryGetProperty("arguments", out var args)
                 ? JsonSerializer.Deserialize<Dictionary<string, object>>(args.GetRawText())!
                 : new Dictionary<string, object>();
@@ -145,7 +127,7 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
             Console.WriteLine($"Argumentos: {JsonSerializer.Serialize(arguments)}");
 
             var toolResult = await mcpClient.CallToolAsync(toolName, arguments);
-            var toolContent = ExtractToolTextContent(toolResult);
+            var toolContent = toolResult.ExtractText();
 
             Console.WriteLine($"Resultado: {toolContent}\n");
 
@@ -154,32 +136,6 @@ Lembre-se: ferramentas têm custo computacional. Use com sabedoria.
                 role = "tool",
                 content = toolContent
             });
-        }
-
-        private static string ExtractToolTextContent(JsonElement toolResult)
-        {
-            if (toolResult.TryGetProperty("content", out var contentArray) &&
-                contentArray.ValueKind == JsonValueKind.Array)
-            {
-                var texts = new List<string>();
-
-                foreach (var item in contentArray.EnumerateArray())
-                {
-                    if (item.TryGetProperty("type", out var type) &&
-                        type.GetString() == "text" &&
-                        item.TryGetProperty("text", out var text))
-                    {
-                        texts.Add(text.GetString()!);
-                    }
-                }
-
-                if (texts.Count > 0)
-                {
-                    return string.Join(" ", texts);
-                }
-            }
-
-            return toolResult.GetRawText();
         }
 
         private static string GetFinalAssistantContent(JsonElement assistantMessage)
